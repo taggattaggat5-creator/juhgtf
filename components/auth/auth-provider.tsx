@@ -95,31 +95,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let mounted = true;
 
-    supabase.auth.getSession().then(async ({ data: { session: s } }) => {
+    // Initial session load — fire-and-forget the async work so the
+    // .then() callback itself stays synchronous and can't deadlock.
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
       if (!mounted) return;
       setSession(s);
       setUser(s?.user ?? null);
       if (s?.user) {
-        await loadUserData(s.user.id);
+        loadUserData(s.user.id).finally(() => {
+          if (mounted) setLoading(false);
+        });
+      } else {
+        setLoading(false);
       }
-      if (mounted) setLoading(false);
     });
 
+    // onAuthStateChange callback MUST be synchronous — Supabase explicitly
+    // warns that an async callback can deadlock, leaving loading: true
+    // forever. We schedule async work outside the callback instead.
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange(async (event, s) => {
+    } = supabase.auth.onAuthStateChange((event, s) => {
       if (!mounted) return;
       if (signingOutRef.current && event !== "SIGNED_OUT") return;
-      // Skip INITIAL_SESSION — getSession() already handles the initial load,
-      // and processing it here would cause a concurrent duplicate loadUserData
-      // call that can race with the getSession path and overwrite valid roles.
+
+      // Skip INITIAL_SESSION — getSession() already handles the initial load.
       if (event === "INITIAL_SESSION") return;
 
-      // TOKEN_REFRESHED: the Supabase client already updated its internal
-      // token. Our React session/user/profile/roles/permissions are all
-      // unchanged — updating session state here would trigger a cascade of
-      // re-renders across every consumer and cause the "Chargement…" screen
-      // when returning to a browser tab. Skip it entirely.
+      // TOKEN_REFRESHED: the client already updated its token. Our React
+      // state is unchanged — updating here would trigger re-renders and
+      // cause the "Chargement…" screen when returning to a browser tab.
       if (event === "TOKEN_REFRESHED") return;
 
       setSession(s);
@@ -129,15 +134,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfile(null);
         setRoles([]);
         setPermissions([]);
-        if (mounted) setLoading(false);
+        setLoading(false);
         return;
       }
 
       // Only refetch profile/roles on actual sign-in.
       if (event === "SIGNED_IN") {
         setLoading(true);
-        await loadUserData(s.user.id);
-        if (mounted) setLoading(false);
+        loadUserData(s.user.id).finally(() => {
+          if (mounted) setLoading(false);
+        });
       }
     });
 
